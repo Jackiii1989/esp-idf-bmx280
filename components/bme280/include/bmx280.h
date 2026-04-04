@@ -35,6 +35,14 @@ extern "C" {
  */
 typedef struct bmx280_t bmx280_t;
 
+/**
+ * Create an dev instance of the BMX280.
+ * @param bmx280 Driver Sturcture.
+ * @param bus_handle I2C master bus handle.
+ * @returns Error codes.
+ */
+esp_err_t bmx280_dev_init(bmx280_t** bmx280,i2c_master_bus_handle_t bus_handle);
+
 #if CONFIG_USE_I2C_MASTER_DRIVER
 /**
  * Create an instance of the BMX280 driver.

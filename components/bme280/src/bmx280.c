@@ -161,6 +161,26 @@ static esp_err_t bmx280_device_create(bmx280_t *bmx280, const uint16_t dev_addr)
     }
 }
 #endif
+/**
+ * Init dev sensor.
+ * @param bmx280 Driver Sturcture.
+ * @param bus_handle I2C master bus handle.
+ * @returns Error codes.
+ */
+
+esp_err_t bmx280_dev_init(bmx280_t** bmx280,i2c_master_bus_handle_t bus_handle)
+{
+    *bmx280 = bmx280_create_master(bus_handle);
+    if (!*bmx280) { 
+        ESP_LOGE("test", "Could not create bmx280 driver.");
+        return ESP_FAIL;
+    }
+    
+    ESP_ERROR_CHECK(bmx280_init(*bmx280));
+    bmx280_config_t bmx_cfg = BMX280_DEFAULT_CONFIG;
+    ESP_ERROR_CHECK(bmx280_configure(*bmx280, &bmx_cfg));
+    return ESP_OK;
+}
 
 /**
  * Read from sensor.

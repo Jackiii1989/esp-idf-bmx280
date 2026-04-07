@@ -71,8 +71,8 @@ extern "C" void app_main(void)
             // Print one combined line once per second:
             //   RPM + temperature + pressure + humidity
             ESP_LOGI(TAG,
-                     "RPM=%.1f, temp=%.2f C, pres=%.2f Pa, hum=%.2f RH",
-                     s_rpm_1s, temp, pres, hum);
+                     "RPM=%.1f, temp=%.2f C, pres=%.2f Pa",
+                     s_rpm_1s, temp, pres);
         
         }
         // Small sleep so the loop does not busy-spin and waste CPU.

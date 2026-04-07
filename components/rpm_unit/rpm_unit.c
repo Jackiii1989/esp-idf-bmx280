@@ -14,12 +14,12 @@ static const char *TAG = "RPM_UNIT";
 
 // Handle to the PCNT "unit" (counter instance).
 // The new driver represents PCNT resources with opaque handles.
-static pcnt_unit_handle_t s_pcnt_unit = nullptr;
+static pcnt_unit_handle_t s_pcnt_unit = NULL;
 
 void hall_rpm_init(void)
 {
     // Handle for the PCNT channel inside the PCNT unit.
-    pcnt_channel_handle_t pcnt_chan = nullptr;
+    pcnt_channel_handle_t pcnt_chan = NULL;
 
     // low_limit and high_limit define the valid signed count range.
     pcnt_unit_config_t unit_config = {
@@ -80,14 +80,14 @@ void hall_rpm_init(void)
     // Describe the periodic  software timer that will read the PCNT count.
     const esp_timer_create_args_t timer_args = {
         .callback = &rpm_timer_cb,          // function called on every timer tick
-        .arg = nullptr,                     // no custom argument needed
+        .arg = NULL,                     // no custom argument needed
         .dispatch_method = ESP_TIMER_TASK,  // run callback in ESP timer task (simple and safe here)
         .name = "rpm_callback",             // friendly debug name
         .skip_unhandled_events = true,      // avoid piling up callbacks if the system is delayed
     };
 
         // Will receive the created timer handle.
-    esp_timer_handle_t rpm_timer = nullptr;
+    esp_timer_handle_t rpm_timer = NULL;
 
     // Create the timer object.
     ESP_ERROR_CHECK(esp_timer_create(&timer_args, &rpm_timer));

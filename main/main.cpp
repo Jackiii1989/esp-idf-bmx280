@@ -53,6 +53,8 @@ extern "C" void app_main(void)
     hall_rpm_init();
 
     float temp = 0.0f, pres = 0.0f, hum = 0.0f;
+	
+	printf("Sensor started:\r\n");
      // Main application loop.
     while (true)
     {
@@ -68,11 +70,9 @@ extern "C" void app_main(void)
             } while(bmx280_isSampling(bmx280));
 
             ESP_ERROR_CHECK(bmx280_readoutFloat(bmx280, &temp, &pres, &hum));
-            // Print one combined line once per second:
-            //   RPM + temperature + pressure + humidity
-            ESP_LOGI(TAG,
-                     "RPM=%.1f, temp=%.2f C, pres=%.2f Pa",
-                     s_rpm_1s, temp, pres);
+            
+            // CSV: pressure_hpa,temperature_c,humidity_percent  (matches live-plot receiver)
+            printf("%.2f,%.2f,%.2f\r\n", pres / 100.0f, temp, hum);
         
         }
         // Small sleep so the loop does not busy-spin and waste CPU.

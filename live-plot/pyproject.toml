@@ -1,0 +1,11 @@
+[project]
+name = "live-plot"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "pyqt6>=6.10.2",
+    "pyqtgraph>=0.14.0",
+    "pyserial>=3.5",
+]

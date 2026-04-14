@@ -1,457 +1,388 @@
-from __future__ import annotations  # Lets us use modern type hints cleanly.
+from __future__ import annotations
 
-import argparse  # Reads command-line arguments like sender/receiver and --port.
-import math  # Used to generate fake BME280-like demo values in sender mode.
-import sys  # Gives access to command-line args and clean exit handling.
-import threading  # Lets serial reading run in a background thread.
-import time  # Used for timing, delays, and x-axis timestamps.
-from collections import deque  # Efficient rolling buffers for live plotting.
-from queue import Empty, SimpleQueue  # Thread-safe queue between reader thread and GUI.
+import argparse
+# ---------------------------------------------------------------------------
+# [ADDED] csv and datetime are needed for the optional --csv logging feature.
+# ---------------------------------------------------------------------------
+import csv
+import signal
+import sys
+import threading
+import time
+from collections import deque
+from datetime import datetime
+from queue import Empty, SimpleQueue
+from typing import NamedTuple
 
-import pyqtgraph as pg  # Fast live plotting library.
-import serial  # pySerial for COM-port communication on Windows.
-from PyQt6 import QtCore, QtWidgets  # Qt GUI classes used by pyqtgraph.
-
+import pyqtgraph as pg
+import serial
 import serial.tools.list_ports
+from PyQt6 import QtCore, QtWidgets
 
 
-# This queue transports parsed samples from the serial-reader thread
-# to the GUI thread safely.
+# ---------------------------------------------------------------------------
+# [CHANGED] Replaced the raw 4-tuple with a NamedTuple called Sample.
 #
-# Each item is:
-#   (receive_time_seconds, pressure_hpa, temperature_c, humidity_percent)
-sample_queue: SimpleQueue[tuple[float, float, float, float]] = SimpleQueue()
+# Before: SimpleQueue[tuple[float, float, float, float]]
+#         Fields were accessed by position, making it easy to mix up the order.
+#
+# After:  SimpleQueue[Sample]
+#         Each field has a name (sample.pressure_hpa, sample.time_s, …),
+#         so every call site is self-documenting and positional mistakes
+#         are caught immediately.
+# ---------------------------------------------------------------------------
+
+class Sample(NamedTuple):
+    time_s: float
+    rpm: float
+    pressure_hpa: float
+    temperature_c: float
 
 
-# This event is used to stop the background reader thread cleanly.
-stop_event = threading.Event()
+# ---------------------------------------------------------------------------
+# [CHANGED] Removed the two module-level globals (sample_queue, stop_event).
+#
+# Before: Both were global variables shared implicitly by SerialReaderThread
+#         and PlotWindow, creating hidden coupling that makes the code hard
+#         to follow and impossible to unit-test.
+#
+# After:  Both are created in main() and passed explicitly to each class
+#         that needs them. The dependency is now visible at the call site.
+# ---------------------------------------------------------------------------
 
-
-
-
-# --------------------------------------------------------------------------------------------------------------
-# init globals
-# --------------------------------------------------------------------------------------------------------------
 
 class SerialReaderThread(threading.Thread):
-    # This thread continuously reads serial bytes, splits them into lines,
-    # parses each line as:
-    #   pressure,temperature,humidity
-    # and pushes the parsed data into sample_queue.
-    def __init__(self, ser: serial.SerialBase) -> None:
-        super().__init__(daemon=True)  # Daemon thread won't block Python shutdown.
-        self.ser = ser  # Save the already-open serial port object.
-        self.t0 = time.perf_counter()  # Reference start time for receiver-local x-axis.
+    """Background daemon thread that owns all serial I/O.
+
+    Reads raw bytes from the COM port, assembles them into complete lines,
+    parses each line as comma-separated pressure,temperature,humidity values,
+    and pushes the result into the queue for the GUI thread to consume.
+    """
+
+    # [CHANGED] Constructor now receives queue and stop as arguments
+    #           instead of reading the module-level globals.
+    def __init__(
+        self,
+        ser: serial.SerialBase,
+        queue: SimpleQueue[Sample],
+        stop: threading.Event,
+    ) -> None:
+        super().__init__(daemon=True)
+        self.ser = ser
+        self.queue = queue
+        self.stop = stop
+        self.t0 = time.perf_counter()
+
+    # [CHANGED] Extracted CSV parsing into its own method _parse_line().
+    #
+    # Before: The try/except block sat directly inside the byte-reading loop
+    #         in run(), mixing three concerns (I/O, line assembly, parsing)
+    #         in one long method.
+    #
+    # After:  run() stays focused on I/O and line assembly; all parsing
+    #         logic lives here. If the format ever changes, only this
+    #         method needs updating.
+    def _parse_line(self, line: bytearray) -> Sample | None:
+        """Parse one raw line into a Sample, or return None if malformed."""
+        try:
+            text = line.decode("ascii").strip()
+            r, p, t = text.split(",", maxsplit=2)
+            return Sample(
+                time_s=time.perf_counter() - self.t0,
+                rpm=float(r),
+                pressure_hpa=float(p),
+                temperature_c=float(t),
+            )
+        except Exception:
+            # Malformed or partial frames are silently dropped so one bad
+            # frame does not crash the display.
+            return None
 
     def run(self) -> None:
-        # This byte buffer stores raw incoming bytes until a full line arrives.
         buffer = bytearray()
+        synced = False  # True once the "Sensor started:" banner has been seen
 
-        # Keep looping until the main program asks the thread to stop.
-        while not stop_event.is_set():
-            # Number of bytes currently waiting in the serial buffer.
+        while not self.stop.is_set():
             waiting = self.ser.in_waiting
-
-            # Read all currently waiting bytes.
-            # If there are no bytes waiting yet, read 1 byte to keep progress moving.
             chunk = self.ser.read(waiting or 1)
 
-            # If nothing came in, sleep briefly so we do not burn CPU in a tight loop.
             if not chunk:
                 time.sleep(0.001)
                 continue
 
-            # Append the newly received bytes to the local buffer.
             buffer.extend(chunk)
 
-            # Process every complete line currently inside the buffer.
             while True:
-                # Find newline byte, which marks the end of one message.
                 newline_index = buffer.find(b"\n")
-
-                # If no newline exists yet, we do not have a full message.
                 if newline_index == -1:
                     break
 
-                # Extract one raw line without the newline.
                 line = buffer[:newline_index]
+                del buffer[:newline_index + 1]
 
-                # Remove the processed line and the newline from the buffer.
-                del buffer[: newline_index + 1]
+                # [CHANGED] Improved debug print.
+                #
+                # Before: print(line)  → printed raw bytearray repr, hard to read.
+                #
+                # After:  decoded to a readable string with a [raw] prefix so it
+                #         is easy to identify in the terminal. errors='replace'
+                #         prevents a crash if any non-ASCII byte arrives.
+                print(f"[raw] {line.decode('ascii', errors='replace').strip()}")
 
-                try:
-                    # Decode the raw bytes into ASCII text and strip spaces.
-                    # Example:
-                    #   b"1008.52,24.31,47.92" -> "1008.52,24.31,47.92"
-                    text = line.decode("ascii").strip()
-
-                    # Split the line into the three expected fields.
-                    pressure_text, temperature_text, humidity_text = text.split(",", maxsplit=2)
-
-                    # Convert all fields from text to float.
-                    pressure_hpa = float(pressure_text)
-                    temperature_c = float(temperature_text)
-                    humidity_percent = float(humidity_text)
-
-                    # Use receiver-local elapsed time for the x-axis.
-                    receive_time_s = time.perf_counter() - self.t0
-
-                    # Push the parsed sample into the queue for the GUI thread.
-                    sample_queue.put(
-                        (receive_time_s, pressure_hpa, temperature_c, humidity_percent)
-                    )
-
-                except Exception:
-                    # If any malformed line arrives, ignore it and keep going.
-                    # This prevents one bad frame from crashing the whole program.
+                # Skip all lines until the firmware's "Sensor started:" banner.
+                if not synced:
+                    if b"Sensor started:" in line:
+                        synced = True
                     continue
+
+                # [CHANGED] Replaced inline try/except with _parse_line() call.
+                sample = self._parse_line(line)
+                if sample is not None:
+                    self.queue.put(sample)
 
 
 class PlotWindow(QtWidgets.QMainWindow):
-    # This is the GUI window in receiver mode.
-    #
-    # It creates 3 stacked live plots:
-    #   1) pressure
-    #   2) temperature
-    #   3) humidity
-    #
-    # The GUI updates on a timer and redraws in batches for speed.
-    def __init__(self, history: int, refresh_ms: int) -> None:
-        super().__init__()  # Initialize the QMainWindow base class.
+    """Main Qt window with three vertically stacked live plots.
 
-        # Set the title shown in the window frame.
-        self.setWindowTitle("Live Jet Engine Graph")
+    A QTimer fires on the GUI thread at `refresh_ms` intervals, drains
+    the queue, and redraws all three curves in one batch.
+    """
 
-        # Create a normal central widget for the main window.
+    # [CHANGED] Constructor now receives queue as an argument
+    #           instead of reading the module-level global.
+    # ---------------------------------------------------------------------------
+    # [ADDED] csv_writer parameter: optional csv.writer passed in from main().
+    #
+    # When None (default), no CSV is written — existing behaviour is unchanged.
+    # When provided, every sample is appended to the CSV inside
+    # drain_queue_and_redraw(). The file itself is opened and closed in main()
+    # so PlotWindow never owns the file handle.
+    # ---------------------------------------------------------------------------
+    def __init__(
+        self,
+        queue: SimpleQueue[Sample],
+        history: int,
+        refresh_ms: int,
+        csv_writer: csv.writer | None = None,
+    ) -> None:
+        super().__init__()
+        self.queue = queue
+        self._csv_writer = csv_writer
+        self.setWindowTitle("Live BME280 COM Plot")
+
         central_widget = QtWidgets.QWidget()
-
-        # Put that widget into the main window.
         self.setCentralWidget(central_widget)
-
-        # Create a vertical layout so the 3 plots are stacked top-to-bottom.
         layout = QtWidgets.QVBoxLayout(central_widget)
-
-        # Reduce margins slightly so the plots use more space.
         layout.setContentsMargins(6, 6, 6, 6)
-
-        # Add a little spacing between plots.
         layout.setSpacing(6)
 
-        # -----------------------------
-        # Pressure plot
-        # -----------------------------
-        self.pressure_plot = pg.PlotWidget()
-        self.pressure_plot.setLabel("left", "Pressure", units="hPa")
-        self.pressure_plot.showGrid(x=True, y=True)
-        layout.addWidget(self.pressure_plot)
-
-        # Create the pressure curve.
-        self.pressure_curve = self.pressure_plot.plot(
-            [],
-            [],
-            antialias=False,      # Turn off smoothing for speed.
-            autoDownsample=True,  # Reduce displayed density when needed.
-            clipToView=True,      # Only draw visible part of the curve.
-            skipFiniteCheck=True, # Faster if your data is always valid floats.
+        # [CHANGED] Replaced three copy-pasted plot setup blocks with
+        #           calls to _make_plot().
+        #
+        # Before: each plot repeated the same six lines of configuration,
+        #         meaning any styling tweak had to be made three times.
+        #
+        # After:  _make_plot() owns all shared configuration; the three
+        #         calls below only specify what differs between them.
+        self.rpm_plot, self.rpm_curve = self._make_plot(
+            "RPM", "rpm"
+        )
+        
+        self.pressure_plot, self.pressure_curve = self._make_plot(
+            "Pressure", "hPa", link_to=self.rpm_plot
+        )
+        
+        self.temperature_plot, self.temperature_curve = self._make_plot(
+            "Temperature", "°C", link_to=self.rpm_plot, x_label="Receive time"
         )
 
-        # -----------------------------
-        # Temperature plot
-        # -----------------------------
-        self.temperature_plot = pg.PlotWidget()
-        self.temperature_plot.setLabel("left", "Temperature", units="°C")
-        self.temperature_plot.showGrid(x=True, y=True)
-        layout.addWidget(self.temperature_plot)
+        for plot in (self.rpm_plot, self.pressure_plot, self.temperature_plot):
+            layout.addWidget(plot)
 
-        # Link the x-axis to the pressure plot so zoom/pan stays aligned.
-        self.temperature_plot.setXLink(self.pressure_plot)
-
-        # Create the temperature curve.
-        self.temperature_curve = self.temperature_plot.plot(
-            [],
-            [],
-            antialias=False,
-            autoDownsample=True,
-            clipToView=True,
-            skipFiniteCheck=True,
-        )
-
-        # -----------------------------
-        # Humidity plot
-        # -----------------------------
-        self.humidity_plot = pg.PlotWidget()
-        self.humidity_plot.setLabel("left", "Humidity", units="%")
-        self.humidity_plot.setLabel("bottom", "Receive time", units="s")
-        self.humidity_plot.showGrid(x=True, y=True)
-        layout.addWidget(self.humidity_plot)
-
-        # Link the x-axis to the pressure plot here too.
-        self.humidity_plot.setXLink(self.pressure_plot)
-
-        # Create the humidity curve.
-        self.humidity_curve = self.humidity_plot.plot(
-            [],
-            [],
-            antialias=False,
-            autoDownsample=True,
-            clipToView=True,
-            skipFiniteCheck=True,
-        )
-
-        # Rolling x-axis buffer.
         self.x_data = deque(maxlen=history)
-
-        # Rolling pressure buffer.
+        self.rpm_data = deque(maxlen=history)
         self.pressure_data = deque(maxlen=history)
-
-        # Rolling temperature buffer.
         self.temperature_data = deque(maxlen=history)
 
-        # Rolling humidity buffer.
-        self.humidity_data = deque(maxlen=history)
-
-        # Create a timer that periodically updates the GUI.
         self.timer = QtCore.QTimer(self)
-
-        # When the timer fires, call our redraw method.
         self.timer.timeout.connect(self.drain_queue_and_redraw)
-
-        # Start the timer.
-        # Example:
-        #   20 ms -> about 50 redraws per second.
         self.timer.start(refresh_ms)
 
+    # [CHANGED] Added _make_plot() helper to remove the three-way repetition
+    #           that was in __init__ before.
+    def _make_plot(
+        self,
+        label: str,
+        units: str,
+        link_to: pg.PlotWidget | None = None,
+        x_label: str | None = None,
+    ) -> tuple[pg.PlotWidget, pg.PlotDataItem]:
+        
+        """Create a configured PlotWidget + curve pair.
+
+        Shared options (grid, performance flags) are set here once.
+        Callers only pass what differs: axis label, units, and optional x-link.
+        """
+        
+        plot = pg.PlotWidget()
+        plot.setLabel("left", label, units=units)
+        plot.showGrid(x=True, y=True)
+        if link_to is not None:
+            # Linking the x-axis means zoom/pan on any plot applies to all three.
+            plot.setXLink(link_to)
+        if x_label is not None:
+            plot.setLabel("bottom", x_label, units="s")
+        # Performance flags: no antialiasing, auto-thin dense data,
+        # skip drawing outside the visible range, trust all values are finite.
+        curve = plot.plot(
+            [], [],
+            antialias=False,
+            autoDownsample=True,
+            clipToView=True,
+            skipFiniteCheck=True,
+        )
+        return plot, curve
+
     def drain_queue_and_redraw(self) -> None:
-        # This flag tells us whether any new data arrived.
         changed = False
 
-        # Drain all currently queued samples without blocking.
         while True:
             try:
-                receive_time_s, pressure_hpa, temperature_c, humidity_percent = (
-                    sample_queue.get_nowait()
-                )
+                # [CHANGED] Destructuring now uses named fields from Sample
+                #           instead of positional unpacking.
+                sample = self.queue.get_nowait()
             except Empty:
-                # Stop once the queue is empty.
                 break
 
-            # Append the newest values to each rolling buffer.
-            self.x_data.append(receive_time_s)
-            self.pressure_data.append(pressure_hpa)
-            self.temperature_data.append(temperature_c)
-            self.humidity_data.append(humidity_percent)
-
-            # Mark that something changed.
+            self.x_data.append(sample.time_s)
+            self.rpm_data.append(sample.rpm)
+            self.pressure_data.append(sample.pressure_hpa)
+            self.temperature_data.append(sample.temperature_c)
+            # -------------------------------------------------------------------
+            # [ADDED] CSV row write — runs only when --csv flag was given.
+            #
+            # Columns: timestamp (wall clock), time_s (elapsed), rpm,
+            #          pressure_hpa, temperature_c.
+            # Written here on the GUI thread so it stays in sync with the
+            # ring-buffer appends above — no extra locking needed.
+            # -------------------------------------------------------------------
+            if self._csv_writer is not None:
+                ts = datetime.now().isoformat(timespec="milliseconds")
+                self._csv_writer.writerow(
+                    [ts, f"{sample.time_s:.3f}", f"{sample.rpm:.2f}",
+                     f"{sample.pressure_hpa:.2f}", f"{sample.temperature_c:.2f}"]
+                )
             changed = True
 
-        # Only redraw when new data actually arrived.
         if changed:
-            # Update all 3 curves using the same time axis.
-            self.pressure_curve.setData(list(self.x_data), list(self.pressure_data))
-            self.temperature_curve.setData(list(self.x_data), list(self.temperature_data))
-            self.humidity_curve.setData(list(self.x_data), list(self.humidity_data))
+            x = list(self.x_data)
+            self.rpm_curve.setData(x, list(self.rpm_data))
+            self.pressure_curve.setData(x, list(self.pressure_data))
+            self.temperature_curve.setData(x, list(self.temperature_data))
 
     def closeEvent(self, event) -> None:
-        # Ask the background thread to stop when the window closes.
-        stop_event.set()
-
-        # Continue with normal Qt close handling.
+        # stop is set by the finally block in main(), so PlotWindow does not
+        # need to hold a reference to it.
         super().closeEvent(event)
 
 
 def build_parser() -> argparse.ArgumentParser:
-    # Create the top-level argument parser.
     parser = argparse.ArgumentParser(
-        description="Windows COM-port sender/receiver demo for BME280-like data."
+        description="Receive BME280 CSV frames from a Windows COM port and plot them live."
     )
-
-    # Make role optional.
+    parser.add_argument("--port", required=True, help="Serial port, e.g. COM13")
+    parser.add_argument("--baudrate", type=int, default=115200, help="Serial baudrate")
+    parser.add_argument("--history", type=int, default=4000, help="Number of points to keep")
+    parser.add_argument("--refresh-ms", type=int, default=20, help="GUI redraw interval in milliseconds")
+    # ---------------------------------------------------------------------------
+    # [ADDED] --csv flag: enables sample logging to a CSV file.
     #
-    # If the user does not provide it, default to "receiver".
-    #
-    # Valid examples:
-    #   python script.py --port COM13
-    #   python script.py receiver --port COM13
-    #   python script.py sender --port COM12
+    # nargs="?" means the flag accepts an optional value:
+    #   --csv            → const="" triggers auto-naming (bme280_<timestamp>.csv)
+    #   --csv myfile.csv → uses the provided filename
+    #   (omitted)        → default=None, no CSV written
+    # ---------------------------------------------------------------------------
     parser.add_argument(
-        "role",
-        nargs="?",                    # Optional positional argument.
-        choices=("receiver", "sender"),
-        default="receiver",           # Default mode when omitted.
-        help="Role to run. Defaults to receiver."
+        "--csv",
+        metavar="FILE",
+        nargs="?",
+        const="",
+        default=None,
+        help="Save samples to a CSV file. Omit FILE to auto-generate a timestamped name.",
     )
-
-    # Require the serial port explicitly.
-    parser.add_argument(
-        "--port",
-        required=True,
-        help="Serial port name, for example COM12 or COM13."
-    )
-
-    # Allow baudrate override.
-    parser.add_argument(
-        "--baudrate",
-        type=int,
-        default=115200,
-        help="Serial baudrate."
-    )
-
-    # Sender-only setting:
-    # how often the fake sender produces a new sample.
-    parser.add_argument(
-        "--interval-ms",
-        type=float,
-        default=5.0,
-        help="Sender sample interval in milliseconds. 5.0 ms = 200 Hz."
-    )
-
-    # Receiver-only setting:
-    # number of points kept in the rolling history.
-    parser.add_argument(
-        "--history",
-        type=int,
-        default=4000,
-        help="Receiver graph history length in points."
-    )
-
-    # Receiver-only setting:
-    # how often the GUI redraws.
-    parser.add_argument(
-        "--refresh-ms",
-        type=int,
-        default=20,
-        help="Receiver redraw period in milliseconds. 20 ms ~= 50 FPS."
-    )
-
-    # Return the configured parser.
     return parser
 
 
-def run_sender(args: argparse.Namespace) -> int:
-    # Open the requested serial port.
-    #
-    # serial_for_url also supports pySerial URL handlers,
-    # but on Windows you will normally pass a real COM name like COM12.
-    ser = serial.serial_for_url(
-        args.port,
-        baudrate=args.baudrate,
-        timeout=0,
-        write_timeout=0,
-    )
-
-    # Reference time used to create slowly changing fake sensor values.
-    t0 = time.perf_counter()
-
+def open_port_or_exit(port: str, baudrate: int) -> serial.SerialBase:
     try:
-        # Run until the user stops the program with Ctrl+C.
-        while True:
-            # Elapsed time in seconds.
-            t = time.perf_counter() - t0
-
-            # Generate fake but realistic BME280-like values.
-            #
-            # Pressure around 1008 hPa with a very small slow variation.
-            pressure_hpa = 1008.0 + 0.8 * math.sin(2.0 * math.pi * 0.03 * t)
-
-            # Temperature around 24 °C with slow and small fast ripple.
-            temperature_c = (
-                24.0
-                + 1.8 * math.sin(2.0 * math.pi * 0.07 * t)
-                + 0.15 * math.sin(2.0 * math.pi * 1.3 * t)
-            )
-
-            # Humidity around 45 % with its own slower variation.
-            humidity_percent = 45.0 + 4.0 * math.sin(2.0 * math.pi * 0.05 * t + 1.2)
-
-            # Build one CSV line containing exactly:
-            #   pressure,temperature,humidity\n
-            #
-            # Example:
-            #   1008.123,24.532,46.221\n
-            line = (
-                f"{pressure_hpa:.3f},{temperature_c:.3f},{humidity_percent:.3f}\n"
-            ).encode("ascii")
-
-            # Send the line to the COM port.
-            ser.write(line)
-
-            # Sleep until the next sample time.
-            time.sleep(args.interval_ms / 1000.0)
-
-    except KeyboardInterrupt:
-        # Allow graceful exit with Ctrl+C.
-        pass
-    finally:
-        # Always close the serial port before leaving.
-        ser.close()
-
-    # Return success exit code.
-    return 0
-
-
-def run_receiver(args: argparse.Namespace) -> int:
-    # Clear any old stop request.
-    stop_event.clear()
-
-    # Open the serial port for reading.
-    try:
-        ser = serial.serial_for_url(
-            args.port,
-            baudrate=args.baudrate,
-            timeout=0,
-        )
+        return serial.serial_for_url(port, baudrate=baudrate, timeout=0)
     except serial.SerialException as e:
-        print(f"Could not open serial port {args.port}: {e}")
+        print(f"Could not open serial port {port}: {e}")
         print("Available ports:")
-        for port_info in serial.tools.list_ports.comports():
-            print(f"  - {port_info.device} : {port_info.description}")
-        return 1
-
-    # Start the background serial reader thread.
-    reader = SerialReaderThread(ser)
-    reader.start()
-
-    # Create the Qt application object.
-    app = QtWidgets.QApplication(sys.argv)
-
-    # Create the live plotting window.
-    window = PlotWindow(history=args.history, refresh_ms=args.refresh_ms)
-
-    # Give the window an initial size.
-    window.resize(1100, 800)
-
-    # Show the window.
-    window.show()
-
-    try:
-        # Enter the Qt event loop.
-        return app.exec()
-    finally:
-        # Ask the reader thread to stop.
-        stop_event.set()
-
-        # Close the serial port.
-        ser.close()
+        for info in sorted(serial.tools.list_ports.comports()):
+            print(f"  - {info.device}: {info.description}")
+        raise SystemExit(1)
 
 
 def main() -> int:
-    # Build the command-line parser.
-    parser = build_parser()
+    args = build_parser().parse_args()
 
-    # Parse the user arguments.
-    args = parser.parse_args()
+    # [CHANGED] queue and stop are now created here and injected into both
+    #           SerialReaderThread and PlotWindow, replacing the module-level
+    #           globals. Each class receives only what it needs.
+    queue: SimpleQueue[Sample] = SimpleQueue()
+    stop = threading.Event()
 
-    # If role is sender, run sender mode.
-    if args.role == "sender":
-        return run_sender(args)
-
-    # Otherwise run receiver mode.
+    # ---------------------------------------------------------------------------
+    # [ADDED] CSV file setup — only runs when --csv was passed.
     #
-    # Because receiver is the default, this also handles the case where
-    # the user omitted the role completely.
-    return run_receiver(args)
+    # The file is opened here in main() so that PlotWindow never owns the
+    # file handle. The header row is written immediately so the file is valid
+    # even if the session produces no samples. csv_file is closed in the
+    # finally block below to ensure it is flushed on any exit path.
+    # ---------------------------------------------------------------------------
+    csv_file = None
+    csv_writer = None
+    if args.csv is not None:
+        csv_path = args.csv or f"bme280_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
+        csv_file = open(csv_path, "w", newline="", encoding="utf-8")
+        csv_writer = csv.writer(csv_file)
+        csv_writer.writerow(["timestamp", "time_s", "rpm", "pressure_hpa", "temperature_c"])
+        csv_file.flush()
+        print(f"Logging to {csv_path}")
+
+    ser = open_port_or_exit(args.port, args.baudrate)
+    reader = SerialReaderThread(ser, queue=queue, stop=stop)
+    reader.start()
+
+    app = QtWidgets.QApplication(sys.argv)
+
+    # Ctrl+C support: PyQt6's C++ event loop never yields to Python on its
+    # own, so SIGINT would be silently ignored. The no-op QTimer forces a
+    # re-entry into Python every 200 ms, giving the signal handler a window
+    # to fire.
+    def _handle_sigint(*_):
+        stop.set()
+        app.quit()
+
+    signal.signal(signal.SIGINT, _handle_sigint)
+
+    sigint_guard = QtCore.QTimer()
+    sigint_guard.start(200)
+    sigint_guard.timeout.connect(lambda: None)
+
+    window = PlotWindow(queue=queue, history=args.history, refresh_ms=args.refresh_ms, csv_writer=csv_writer)
+    window.resize(1100, 800)
+    window.show()
+
+    try:
+        return app.exec()
+    finally:
+        stop.set()
+        ser.close()
+        if csv_file is not None:
+            csv_file.close()
 
 
 if __name__ == "__main__":
-    # Run main() and exit the process with its return code.
     raise SystemExit(main())

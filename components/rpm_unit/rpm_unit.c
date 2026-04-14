@@ -113,7 +113,7 @@ static volatile int s_last_pulses_200ms = 0;
 
 // Sum of pulses across 5 x 200 ms samples = 1 second total.
 // We use this to get a smoother once-per-second RPM value.
-static volatile int s_pulse_sum_1s = 0;
+static volatile int s_pulse_sum_800ms = 0;
 
 // Counts how many 200 ms samples have been accumulated so far.
 static volatile int s_sample_count = 0;
@@ -129,7 +129,7 @@ static volatile int s_sample_count = 0;
 extern volatile bool s_rpm_ready_1s;
 
 // Final RPM value computed once per second.
-extern volatile float s_rpm_1s;
+extern volatile float s_rpm_800ms;
 
 /**
  * Timer callback that runs every 200 ms.
@@ -157,23 +157,24 @@ static void rpm_timer_cb(void *arg)
     s_last_pulses_200ms = pulses;
 
     // Add this 200 ms sample into the rolling 1-second sum.
-    s_pulse_sum_1s += pulses;
+    s_pulse_sum_800ms += pulses;
 
     // Count how many 200 ms windows we have accumulated.
     s_sample_count++;
 
     // After 5 windows, we have 1 second of data.
-    if (s_sample_count >= 5) {
+    if (s_sample_count >= 4) {
 
         // In 1 second, "pulses per second" is simply the total pulse count.
         // RPM = pulses_per_second * 60 / pulses_per_revolution
         //
         // Example with 1 magnet:
         //   50 pulses in 1 second -> 50 rev/s -> 3000 RPM
-        s_rpm_1s = (s_pulse_sum_1s * 60.0f) / PULSES_PER_REV;
+        //s_rpm_1s = (s_pulse_sum_1s * 60.0f) / PULSES_PER_REV;
+        s_rpm_800ms = (s_pulse_sum_800ms * 75.0f) / PULSES_PER_REV;
 
         // Reset the accumulator for the next 1-second block.
-        s_pulse_sum_1s = 0;
+        s_pulse_sum_800ms = 0;
 
         // Reset sample counter back to 0.
         s_sample_count = 0;

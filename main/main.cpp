@@ -20,7 +20,7 @@ static const char *TAG = "MAIN";
 // Flag set by the timer callback when a fresh 1-second RPM value is ready.
 volatile bool s_rpm_ready_1s = false;
 // Final RPM value computed once per second.
-volatile float s_rpm_1s = 0.0f;
+volatile float s_rpm_800ms = 0.0f;
 
 i2c_master_bus_handle_t i2c_bus_init(gpio_num_t sda_io, gpio_num_t scl_io)
 {
@@ -72,7 +72,7 @@ extern "C" void app_main(void)
             ESP_ERROR_CHECK(bmx280_readoutFloat(bmx280, &temp, &pres, &hum));
             
             // CSV: pressure_hpa,temperature_c,humidity_percent  (matches live-plot receiver)
-            printf("%.2f,%.2f,%.2f\r\n", pres / 100.0f, temp, hum);
+            printf("%.2f,%.2f,%.2f\r\n", s_rpm_800ms,pres / 100.0f, temp);
         
         }
         // Small sleep so the loop does not busy-spin and waste CPU.

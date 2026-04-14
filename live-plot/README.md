@@ -32,16 +32,7 @@ The CSV contains columns: `timestamp, time_s, rpm, pressure_hpa, temperature_c`.
 Use a virtual COM pair (e.g. [com0com](https://com0com.sourceforge.net/) on Windows) and run the sender on one port while the plotter listens on the other:
 
 ```bash
-uv run python sender.py --port COM<N>   # terminal 1 — injects sine-wave data
 uv run python main.py --port COM<M>     # terminal 2 — plots it
-```
-
-### Calibration logger
-
-Records resistance, temperature, and humidity readings to a CSV file in `./calibration/`. The filename is built automatically from the pipe metadata sent by the firmware.
-
-```bash
-uv run python test.py --port COM<N>
 ```
 
 ## Options
@@ -55,11 +46,3 @@ uv run python test.py --port COM<N>
 | `--history` | `4000` | Number of data points kept on screen |
 | `--refresh-ms` | `20` | GUI redraw interval in milliseconds |
 | `--csv [FILE]` | off | Save to CSV; omit `FILE` for an auto-named file |
-
-### `sender.py`
-
-| Flag | Default | Description |
-|---|---|---|
-| `--port` | *(required)* | Serial port to write to |
-| `--baudrate` | `115200` | Serial baud rate |
-| `--interval-ms` | `5.0` | Delay between samples (5 ms = 200 Hz) |

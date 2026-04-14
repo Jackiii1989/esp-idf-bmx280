@@ -126,7 +126,7 @@ static volatile int s_sample_count = 0;
 //--------------------------------------------------------------------------------
 
 // Flag set by the timer callback when a fresh 1-second RPM value is ready.
-extern volatile bool s_rpm_ready_1s;
+extern volatile bool s_rpm_ready_800ms;
 
 // Final RPM value computed once per second.
 extern volatile float s_rpm_800ms;
@@ -180,6 +180,6 @@ static void rpm_timer_cb(void *arg)
         s_sample_count = 0;
 
         // Tell the main loop that a new RPM result is ready to print.
-        s_rpm_ready_1s = true;
+        s_rpm_ready_800ms = true;
     }
 }

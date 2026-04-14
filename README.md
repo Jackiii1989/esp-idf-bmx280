@@ -1,41 +1,63 @@
 
 ## Overview
 
-TODO
+ESP32-S3 firmware that reads a BME280 environmental sensor and a Hall-effect RPM sensor, then streams CSV data over UART for live plotting.
 
 ## How to use example
 
 ### Hardware Required
 
-To run this example, you should have an Espressif development board based.
+An ESP32-S3 development board with:
+- A BME280 (or BMP280) environmental sensor connected via I2C
+- A Hall-effect RPM sensor connected to GPIO42
 
 #### Pin Assignment
 
-**Note:** The following pin assignments are used by default, you can change these in the `menuconfig` .
+| Signal       | GPIO |
+| ------------ | ---- |
+| I2C SDA      | 12   |
+| I2C SCL      | 14   |
+| Hall sensor  | 42   |
 
-|                  | SDA             | SCL           |
-| ---------------- | -------------- | -------------- |
-| ESP I2C Master   | I2C_MASTER_SDA | I2C_MASTER_SCL |
-| MPU9250 Sensor   | SDA            | SCL            |
-
-For the actual default value of `I2C_MASTER_SDA` and `I2C_MASTER_SCL` see `Example Configuration` in `menuconfig`.
-
-**Note:** There's no need to add an external pull-up resistors for SDA/SCL pin, because the driver will enable the internal pull-up resistors.
+Internal pull-ups are enabled on SDA/SCL — no external resistors needed.
 
 ### Build and Flash
 
-Enter `idf.py -p PORT flash monitor` to build, flash and monitor the project.
+```bash
+idf.py build
+idf.py -p COM<N> flash monitor   # flash and open serial monitor
+idf.py menuconfig                 # configure SDK/component options
+```
 
-(To exit the serial monitor, type ``Ctrl-]``.)
+(To exit the serial monitor, type `Ctrl-]`.)
 
-See the [Getting Started Guide](https://docs.espressif.com/projects/esp-idf/en/latest/get-started/index.html) for full steps to configure and use ESP-IDF to build projects.
+### Key menuconfig Options
+
+- `BMX280 Options → I2C driver setting` — set to **I2C Master Driver** (required for ESP-IDF ≥ 5.3)
+- `BMX280 Options → I2C Clock Speed` — default 100 kHz
+- `BMX280 Options → Installed Sensor Model` — auto-detect by default
+- `BMX280 Options → I2C Slave Address` — auto-detect by default (0x76 or 0x77)
 
 ## Example Output
 
+```
+Sensor started:
+0.00,1013.25,24.50
+12.34,1013.18,24.52
+```
+
+Serial format (115200 baud): `rpm,pressure_hpa,temperature_c`
+
+## Live Plot
+
+A Python PyQt6 GUI for live plotting is in `live-plot/`. Package manager: `uv`.
+
 ```bash
-I (328) example: I2C initialized successfully
-I (338) example: WHO_AM_I = 71
-I (338) example: I2C de-initialized successfully
+cd live-plot
+uv run python main.py --port COM<N>               # receive and plot
+uv run python main.py --port COM<N> --csv         # also log to auto-named CSV
+uv run python main.py --port COM<N> --csv out.csv # also log to named CSV
+uv run python sender.py --port COM<N>             # inject synthetic test data
 ```
 
 ## Troubleshooting

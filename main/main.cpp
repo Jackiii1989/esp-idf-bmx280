@@ -18,7 +18,7 @@ static const char *TAG = "MAIN";
 
 
 // Flag set by the timer callback when a fresh 1-second RPM value is ready.
-volatile bool s_rpm_ready_1s = false;
+volatile bool s_rpm_ready_800ms = false;
 // Final RPM value computed once per second.
 volatile float s_rpm_800ms = 0.0f;
 
@@ -59,10 +59,10 @@ extern "C" void app_main(void)
     while (true)
     {
         // Only do the expensive/logging work once a fresh 1-second RPM value is ready.
-        if (s_rpm_ready_1s) {
+        if (s_rpm_ready_800ms) {
 
             // Clear the flag immediately so we don't print the same sample twice.
-            s_rpm_ready_1s = false;
+            s_rpm_ready_800ms = false;
 
             // Wait until the BMX280 finishes any current conversion cycle.
             do {

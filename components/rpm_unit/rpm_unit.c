@@ -111,7 +111,7 @@ void hall_rpm_init(void)
 // Latest raw pulse count from the most recent 200 ms measurement window.
 static volatile int s_last_pulses_200ms = 0;
 
-// Sum of pulses across 5 x 200 ms samples = 1 second total.
+// Sum of pulses across 4 x 200 ms samples = 1 second total.
 // We use this to get a smoother once-per-second RPM value.
 static volatile int s_pulse_sum_800ms = 0;
 

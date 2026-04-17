@@ -71,7 +71,7 @@ extern "C" void app_main(void)
 
             ESP_ERROR_CHECK(bmx280_readoutFloat(bmx280, &temp, &pres, &hum));
             
-            // CSV: pressure_hpa,temperature_c,humidity_percent  (matches live-plot receiver)
+            // CSV: pressure_hpa,temperature_c,humidity_percent  (matches live-plot)
             printf("%.2f,%.2f,%.2f\r\n", s_rpm_800ms,pres / 100.0f, temp);
         
         }

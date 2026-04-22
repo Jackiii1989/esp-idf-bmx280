@@ -14,10 +14,12 @@ effort: high
 You are an expert embedded systems reviewer specializing in ESP-IDF C/C++ on ESP32-S3. Read the source files systematically, apply the full checklist below, and report findings grouped by severity with file names, line numbers, specific fixes, and — crucially — **why the pattern is problematic**. Explaining the design reasoning builds better instincts, not just a one-time fix.
 
 Reference material in this skill folder:
-- [memory-safety.md](memory-safety.md) — dangerous functions, pointer management, heap patterns, stack limits
+- [memory-safety.md](memory-safety.md) — dangerous functions, pointer management, heap patterns, stack limits, PSRAM/DMA
 - [freertos-patterns.md](freertos-patterns.md) — task creation, priority assignment, synchronization, ISR patterns
 - [esp-idf-style.md](esp-idf-style.md) — naming conventions, include order, brace style, error handling
 - [common-bugs.md](common-bugs.md) — integer overflow, sign conversion, concurrency bugs, security vulnerabilities
+- [peripheral-drivers.md](peripheral-drivers.md) — PCNT, I2C Master, NVS, esp_timer patterns and known driver bugs
+- [iram-flash-cache.md](iram-flash-cache.md) — IRAM safety, flash cache disable window, driver _ISR_IRAM_SAFE Kconfig options
 
 ## Detect mode from argument
 
@@ -101,6 +103,9 @@ Reference material in this skill folder:
 
 - **IRAM_ATTR missing on ISR handlers** — functions called from ISRs (including callbacks registered with driver APIs) must be in IRAM, or they will crash when the flash cache is disabled during a flash write.
   > Why: The ESP32-S3 XTS-AES flash encryption and OTA updates disable the flash cache briefly. If the ISR handler is in flash (the default), a cache miss during that window causes an `IRAM_ATTR` violation and hard fault.
+
+- **`_ISR_IRAM_SAFE` Kconfig option missing for driver using ISR callbacks** — for PCNT, GPTimer, SPI Master, and GPIO, adding `IRAM_ATTR` to the user callback alone is insufficient; the driver's own interrupt dispatch code also lives in flash by default and must be moved to IRAM via the corresponding `CONFIG_<DRIVER>_ISR_IRAM_SAFE` Kconfig option. See [iram-flash-cache.md](iram-flash-cache.md) for the full table.
+  > Why: When the flash cache is disabled (NVS commit, OTA write), the CPU executes the driver's ISR dispatch code from flash — causing an immediate cache-miss panic before the user callback is ever reached. `IRAM_ATTR` on the user callback does not protect the driver's dispatch path.
 
 - **Non-volatile shared variable between ISR and task** — variables written in ISR context and read in task context must be `volatile`. Without it the compiler is free to cache the value in a register and never re-read from memory.
   > Why: `-O2`/`-Os` (ESP-IDF defaults) optimizes repeated reads of the same variable into a single register load. The task loop sees the stale register value and never observes the ISR's update.
@@ -229,6 +234,137 @@ Reference material in this skill folder:
 
 - **`CMakeLists.txt` missing component dependencies** — `target_link_libraries` in a component's `CMakeLists.txt` does not list all components it actually uses (relies on transitive deps).
   > Why: Transitive deps are an implementation detail of the dependency. When that intermediate component changes its own deps, the build silently breaks. Explicit deps are self-documenting and robust.
+
+---
+
+### 8. ESP32-S3 Hardware-Specific Pitfalls
+
+- **PSRAM/DMA cache coherency violation** — allocating a buffer with `malloc()` (internal DRAM) and passing it to a DMA-capable driver is fine. But allocating from PSRAM (`MALLOC_CAP_SPIRAM`) and passing to DMA requires explicit cache synchronization: call `esp_cache_msync(buf, len, ESP_CACHE_MSYNC_FLAG_DIR_C2M)` after CPU writes (before DMA reads) and `ESP_CACHE_MSYNC_FLAG_DIR_M2C` after DMA writes (before CPU reads). Missing this causes the CPU to read stale cached data.
+  > Why: On ESP32-S3, PSRAM is accessed via a cache. DMA bypasses the cache and writes directly to SPIRAM. Without `esp_cache_msync()`, the CPU reads old values from its cache rather than what DMA wrote.
+
+- **DMA descriptors placed in PSRAM** — the DMA hardware (SPI, I2S, LCD, etc.) requires its descriptors (linked list nodes) to be in internal DRAM, not PSRAM. Allocate them with `heap_caps_malloc(size, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL)`.
+  > Why: The DMA engine cannot address PSRAM for its control structures. Placing descriptors there causes silent transfer failures or hard faults during DMA operations.
+
+- **Large static arrays consuming IRAM** — `static uint8_t large_buf[8192];` in a `.c` file goes into DRAM by default, but if it ends up in a section linked to IRAM (e.g., placed in IRAM_ATTR translation unit), it wastes the precious ~400 KB IRAM. Add `DRAM_ATTR` to force DRAM placement: `static DRAM_ATTR uint8_t large_buf[8192];`
+  > Why: IRAM is a shared resource for ISR handlers and time-critical code. Wasting it on data arrays leaves less room for IRAM_ATTR functions and increases cache miss pressure.
+
+- **DMA-capable PSRAM allocation** — when you need a large DMA buffer in PSRAM, use `esp_dma_malloc(size, ESP_DMA_MALLOC_FLAG_PSRAM, (void **)&buf, &actual_size)` (ESP-IDF >= 5.2). This is the recommended API and satisfies both cache-line and DMA alignment in one call. On older versions, `heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA)` is still valid.
+  > Why: Plain `heap_caps_malloc(size, MALLOC_CAP_SPIRAM)` may return an address that is not DMA-aligned, causing bus faults when the DMA hardware tries to access it. `esp_dma_malloc` encapsulates the correct alignment logic and is the Espressif-recommended path in ESP-IDF 5.x+ documentation.
+
+- **Flash cache disabled window not covered by IRAM_ATTR** — during OTA writes, `nvs_commit()`, or flash encryption operations, the flash cache is briefly disabled. Any code not in IRAM that runs at this moment (timer callbacks, FreeRTOS hooks, driver callbacks) will crash with `Cache disabled but cached memory region accessed`.
+  > Why: Unlike IRAM_ATTR on ISR handlers (which is well-known), callback functions registered with `esp_timer`, `pcnt_unit_register_event_callbacks`, and similar APIs are easy to forget. All such callbacks must also carry `IRAM_ATTR`.
+
+- **`esp_cache_msync` called on non-cache-line-aligned buffer** — `esp_cache_msync()` requires both the buffer address and size to be aligned to the cache line size (64 bytes on ESP32-S3). A call on a buffer from plain `heap_caps_malloc(..., MALLOC_CAP_SPIRAM)` (not DMA-aligned) returns `ESP_ERR_INVALID_ARG` silently and performs no synchronization, leaving the CPU reading stale data. Always allocate PSRAM buffers used with `esp_cache_msync` via `esp_dma_malloc()` or `heap_caps_malloc(..., MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA)`.
+  > Why: Cache-line alignment is a hardware requirement of the cache coherency controller. An unaligned sync call fails silently — no error is logged, the CPU reads old cached values after DMA writes, and the corruption has no obvious cause.
+
+- **All tasks pinned to core 0** — on dual-core ESP32-S3, pinning every application task to PRO_CPU (core 0) competes with the WiFi/BT stack which prefers core 0. Computation-heavy tasks should be pinned to APP_CPU (core 1) or left unpinned.
+  > Why: WiFi runs at a high priority on core 0. Saturating core 0 with application tasks increases WiFi latency, causes Tx/Rx packet drops, and can trigger WiFi watchdog resets.
+
+---
+
+### 9. esp_timer Callback Pitfalls
+
+- **Blocking inside an ESP_TIMER_TASK callback** — by default, `esp_timer` dispatches callbacks from a single high-priority `esp_timer` task. Blocking (`vTaskDelay`, `xSemaphoreTake`, `ESP_LOGI`, `malloc`) in a callback delays every subsequent pending callback because execution is serialized.
+  > Why: The esp_timer task processes all TASK-dispatch timers sequentially. A 50 ms blocking call inside one callback pushes all other timers out by 50 ms, violating their periods.
+
+- **`portYIELD_FROM_ISR` called from ESP_TIMER_ISR callback** — timers created with `ESP_TIMER_ISR` dispatch run inside the hardware timer ISR. Calling `portYIELD_FROM_ISR()` directly is illegal; use `esp_timer_isr_dispatch_need_yield()` instead, which schedules the yield after all ISR-dispatch callbacks complete.
+  > Why: The ISR dispatch mode processes multiple timer callbacks in one ISR invocation. An intermediate `portYIELD_FROM_ISR()` would exit before remaining callbacks run, causing missed firings.
+
+- **`esp_timer_start`/`esp_timer_stop` called from inside an ISR-dispatch callback** — modifying timer state from within an `ESP_TIMER_ISR` callback is illegal and undefined.
+  > Why: The timer API acquires an internal spinlock. Calling it while already holding the same lock from ISR context causes a deadlock or assertion failure.
+
+- **Timer callback doing real work instead of signaling** — if a timer callback does I2C reads, string formatting, or anything non-trivial, move the work to a task. Signal the task with `xTaskNotifyGiveFromISR` (for ISR dispatch) or a semaphore give (for TASK dispatch).
+  > Why: Long callbacks block the esp_timer task (TASK mode) or extend the ISR window (ISR mode), both of which degrade system responsiveness and can trigger the interrupt watchdog.
+
+- **esp_timer handle not deleted on cleanup path** — `esp_timer_delete()` must be called after `esp_timer_stop()` when tearing down a subsystem. Leaking the handle leaves the timer registered permanently.
+  > Why: A stopped timer's handle still occupies memory in the timer list. Re-initializing the subsystem and creating a new timer without deleting the old one eventually exhausts the timer handle pool.
+
+- **Periodic timer + light sleep firing burst** — when `CONFIG_PM_ENABLE` is set and the device enters light sleep, a periodic `esp_timer` continues to logically expire but its callbacks are deferred. On wakeup, all accumulated missed firings execute back-to-back. For timers that drive sampling loops, this burst causes spurious data points and can overflow the esp_timer task queue. Set `skip_unhandled_events = true` in `esp_timer_create_args_t` to coalesce all missed firings into a single post-wakeup callback.
+  > Why: A 200 ms periodic timer that fires 5 times during a 1-second sleep will execute its callback 5 times in rapid succession on wakeup. Without `skip_unhandled_events`, the burst is indistinguishable from a real high-rate event, and the application's state machine or sensor loop may process stale back-dated data.
+
+---
+
+### 10. Peripheral Driver Pitfalls (PCNT, I2C Master, NVS)
+
+#### PCNT (Pulse Counter)
+
+- **PCNT watchpoint/event callback violating ISR rules** — callbacks registered via `pcnt_unit_register_event_callbacks()` are invoked from ISR context. They must not block, must not call non-ISR FreeRTOS APIs, and should use `xQueueSendFromISR` / `vTaskNotifyGiveFromISR` to defer work.
+  > Why: Like any ISR, PCNT event callbacks run with the CPU's interrupt flag set. Calling `xQueueReceive` or `ESP_LOGI` from one causes a FreeRTOS assertion or corrupted scheduler state.
+
+- **Glitch filter configured after unit enabled** — `pcnt_unit_set_glitch_filter()` must be called while the unit is in the `init` state (before `pcnt_unit_enable()`). Calling it afterward returns `ESP_ERR_INVALID_STATE` and the filter is not applied.
+  > Why: The PCNT hardware latches the filter configuration at enable time. Post-enable changes are rejected to prevent mid-operation reconfiguration.
+
+- **APB clock instability with glitch filter under power management** — if `CONFIG_PM_ENABLE` is set and the device can enter light sleep, the APB clock frequency may change, causing the glitch filter (which is APB-clock-based) to misinterpret valid pulses as noise. In ESP-IDF >= 5.3.2 (including v6.0), `pcnt_unit_enable()` unconditionally acquires the `ESP_PM_APB_FREQ_MAX` lock — the device cannot enter light sleep while any PCNT unit is enabled, with or without a glitch filter. In earlier versions (< 5.3.2) the lock was only acquired when a glitch filter was configured. Verify this side-effect is acceptable for your power budget; call `pcnt_unit_disable()` when the counter is not needed.
+  > Why: The glitch filter's `max_glitch_ns` is converted to APB cycles at configuration time. If APB slows down, the cycle count stays the same but the effective glitch width changes, silently dropping legitimate pulses. The unconditional lock in 5.3.2+ is a correctness fix but prevents all light sleep while the PCNT unit is enabled.
+
+- **PCNT counter not cleared before first read** — after `pcnt_unit_enable()` + `pcnt_unit_start()`, the hardware counter may contain a non-zero residual value. Call `pcnt_unit_clear_count()` before the first timed window to avoid an erroneous first RPM reading.
+  > Why: The PCNT hardware preserves its count register across enable/disable cycles. A leftover count from a previous run or power-on state adds phantom pulses to the first measurement window.
+
+#### I2C Master (driver/i2c_master.h)
+
+- **Bus handle and device handle lifecycle mismatch** — `i2c_master_bus_handle_t` is created once per bus via `i2c_new_master_bus()`; `i2c_master_dev_handle_t` is created per device via `i2c_master_bus_add_device()`. Deleting the bus handle while device handles are still attached, or vice versa, is undefined.
+  > Why: The bus handle owns the hardware resource. Deleting it invalidates all device handles that reference it, but the driver has no way to notify them — subsequent device operations crash.
+
+- **Mixing old `driver/i2c.h` and new `driver/i2c_master.h` APIs** — the two drivers are mutually exclusive. Calling `i2c_driver_install()` and then `i2c_new_master_bus()` on the same port, or including both headers, causes undefined behaviour.
+  > Why: The old and new drivers both try to configure the same I2C peripheral registers and interrupt vectors. Double-initialization corrupts the hardware state.
+
+- **`i2c_master_transmit_receive()` returning ESP_OK on NACK** — a known ESP-IDF issue: if the device NAKs the address byte, some driver versions still return `ESP_OK`. Do not assume a successful return means the device acknowledged the transaction; validate data plausibility where possible.
+  > Why: Silent NACK means the bus completed a transaction but the device never responded. Reading sensor values from a device that is not present returns garbage data that looks like valid readings.
+
+- **Timeout not set for clock-stretching devices** — devices that do clock stretching (e.g., BME280 during measurements) may hold SCL low beyond the default timeout, causing `ESP_ERR_TIMEOUT`. Set `i2c_master_dev_config_t::scl_wait_us` to a value larger than the device's maximum stretch time.
+  > Why: The default timeout is short (typically a few hundred µs). A sensor that stretches clock for 2–3 ms (e.g., during forced-mode measurement) will reliably time out and return an error even when the device is working correctly.
+
+#### NVS (Non-Volatile Storage)
+
+- **Missing `nvs_commit()` after write** — `nvs_set_*()` functions write to an in-memory cache; the data is not guaranteed to persist across a reboot until `nvs_commit()` is called.
+  > Why: If the device reboots between `nvs_set_u32()` and `nvs_commit()`, the update is silently lost. For configuration values this means the device reverts to defaults unexpectedly.
+
+- **Namespace or key longer than 15 characters** — NVS namespaces and keys are silently truncated to 15 characters. Two keys that share the first 15 characters collide.
+  > Why: NVS stores keys as fixed-length 16-byte fields (15 chars + null). Truncation is not an error — it causes a silent collision where two different logical keys read and write the same physical entry.
+
+- **Handle not closed after use** — `nvs_close()` must be called when the handle is no longer needed. Open handles consume NVS internal resources.
+  > Why: NVS has a limited number of open handle slots. Leaking handles eventually causes `nvs_open()` to return `ESP_ERR_NVS_NOT_ENOUGH_SPACE` even when NVS flash is not full.
+
+- **Not handling `ESP_ERR_NVS_NO_FREE_PAGES`** — on first boot or after a flash erase, `nvs_flash_init()` may return this error. The correct recovery is: `nvs_flash_erase(); nvs_flash_init();`
+  > Why: NVS uses a wear-leveling scheme that can leave the partition in an unclean state after a power loss during write. Erasing and reinitializing recovers the partition at the cost of all stored values.
+
+---
+
+### 11. C++ Pitfalls (main.cpp / C++ translation units)
+
+- **FreeRTOS primitives used in global constructors** — global C++ objects with constructors run before `app_main()` is called, and critically, before the FreeRTOS scheduler starts. Do not call `xTaskCreate`, `xTaskCreatePinnedToCore`, or any blocking FreeRTOS API in a global constructor. Queue and semaphore *creation* (`xQueueCreate`, `xSemaphoreCreateBinary`) allocates from the heap and may appear to succeed, but any API that requires the scheduler to be running is undefined behaviour.
+  > Why: The FreeRTOS heap is initialized during secondary system init, which runs before constructors — so `xQueueCreate` may succeed in a constructor but `xTaskCreate` will not. The scheduler itself starts later when the main task is created. Per the ESP-IDF v6.0 Application Startup Flow docs, constructors always run before `vTaskStartScheduler()`. Defer all scheduler-dependent initialization to `app_main` or an `ESP_SYSTEM_INIT_FN`-annotated component init function.
+
+- **Exceptions silently disabled** — ESP-IDF disables C++ exceptions by default (`CONFIG_COMPILER_CXX_EXCEPTIONS=n`). Any `throw` (including implicit ones from `std::bad_alloc`, `std::out_of_range`) calls `abort()` immediately. Code ported from desktop that relies on `try`/`catch` will crash the device instead of recovering.
+  > Why: The toolchain replaces exception unwind machinery with `abort()` to save code size. A `std::vector::at()` out-of-range access — harmless with exceptions — reboots the ESP32.
+
+- **`new` without `nothrow` in embedded context** — `new T()` throws `std::bad_alloc` on allocation failure when exceptions are enabled. With exceptions disabled, it calls `abort()`. Use `new (std::nothrow) T()` and check for `nullptr` to get the same safe pattern as `malloc`.
+  > Why: On an ESP32 with limited heap, allocation failures are runtime conditions, not programming errors. Aborting on OOM is user-hostile; returning `nullptr` allows graceful degradation.
+
+- **`std::string` / STL containers in high-frequency paths** — `std::string`, `std::vector`, etc. call `malloc`/`free` internally. Using them in a control loop, timer callback, or ISR-signaled task introduces non-deterministic allocation latency and fragmentation.
+  > Why: Heap allocation is non-deterministic on embedded targets. A sensor loop that builds a `std::string` for each CSV line will eventually block on a slow `malloc` and miss a timing deadline.
+
+- **Static local variable initialization race** — C++11 guarantees thread-safe initialization of static local variables via `__cxa_guard_acquire`. On multi-core ESP32-S3, this acquire may spin-wait. In ISR context it will deadlock if the guard is already locked by a preempted task.
+  > Why: `__cxa_guard_acquire` uses a spinlock-style protocol. An ISR that triggers first-time initialization of a static local will spin forever if the initialization was already in progress on the other core.
+
+- **`static` C++ objects with non-trivial destructors** — destructors of global/static C++ objects are registered with `atexit()`. On ESP32, `atexit` handlers do not run on `abort()` or power cycle — only on graceful `exit()`, which almost never happens. Relying on destructors for cleanup (releasing semaphores, flushing NVS) is unreliable.
+  > Why: Embedded systems rarely call `exit()` cleanly. If the device is rebooted via `esp_restart()` or `abort()`, destructors never run, leaving hardware in an undefined state.
+
+---
+
+### 12. Watchdog Timer Management
+
+- **Task not subscribed to TWDT before long operation** — if a task is subscribed to the Task Watchdog Timer (`esp_task_wdt_add(NULL)`) but runs a long computation without calling `esp_task_wdt_reset(NULL)`, the TWDT fires and reboots the device. Either shorten the operation, break it into yielding steps, or temporarily unsubscribe during the long operation.
+  > Why: The TWDT timeout defaults to 5 seconds. Any task that holds the CPU continuously for longer without yielding triggers a reboot even if the task is making progress.
+
+- **Raising watchdog timeout to suppress a symptom** — increasing `CONFIG_ESP_TASK_WDT_TIMEOUT_S` to stop watchdog resets is almost always wrong. The TWDT fires because a task is busy-waiting or stuck. Fix the root cause.
+  > Why: A longer timeout delays the reboot but does not fix the starvation or lock-up that triggered it. In production, the device will still freeze; it just takes longer to reboot, making the user experience worse.
+
+- **Critical section too wide triggers IWDT** — the Interrupt Watchdog Timer (IWDT) fires when interrupts are blocked for longer than ~0.3 seconds (default). A `portENTER_CRITICAL()` block that includes I2C transactions, flash reads, or UART writes will trigger the IWDT.
+  > Why: The IWDT is the last line of defense against ISR starvation. Unlike the TWDT, an IWDT panic is not recoverable via task restructuring — it requires shrinking the critical section.
+
+- **Idle task not given CPU time** — on each core, FreeRTOS runs an idle task that resets the TWDT and performs memory cleanup (`pvPortFree` deferred calls). A task at priority > 0 that never blocks starves the idle task, causing TWDT to fire even if the task is not "stuck".
+  > Why: The TWDT monitors the idle task's execution, not individual application tasks. Starving the idle task looks identical to a hung task from the watchdog's perspective.
 
 ---
 

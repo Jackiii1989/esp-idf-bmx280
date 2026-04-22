@@ -371,21 +371,60 @@ void process() {
 }
 ```
 
-## ESP32 Specific Considerations
+## ESP32-S3 Specific Considerations
 
 ### IRAM vs DRAM
-- **IRAM**: Fast instruction RAM (in-memory), limited (~128 KB)
-- **DRAM**: Slower DRAM for data, but more (~/100+ KB free)
+- **IRAM**: Fast instruction RAM (in-memory), limited (~400 KB on S3)
+- **DRAM**: Main data RAM; more space but cache-accessed
+- **PSRAM/SPIRAM**: External SPI RAM (up to 8 MB on S3); slow, cache-mediated, not DMA-safe by default
 
-**BAD** - Large allocations in IRAM:
+**BAD** - Large static allocation in IRAM:
 ```c
-uint8_t large_buffer[10000] = {...};  // Goes to IRAM if static, wastes precious space
+uint8_t large_buffer[10000] = {...};  // Wastes scarce IRAM if not forced to DRAM
 ```
 
-**GOOD** - Put large buffers in DRAM:
+**GOOD** - Force large static data to DRAM:
 ```c
-uint8_t large_buffer[10000] = {...};  // Put in DRAM with attribute
-static uint8_t DRAM_ATTR large_buffer[10000];
+static DRAM_ATTR uint8_t large_buffer[10000];  // Explicitly in DRAM
+```
+
+### PSRAM / DMA Cache Coherency
+
+When using PSRAM (external RAM) on ESP32-S3, the CPU accesses it via a cache. DMA hardware bypasses the cache. Failing to synchronize causes stale data reads.
+
+**BAD** - DMA result read without cache invalidation:
+```c
+uint8_t *buf = heap_caps_malloc(size, MALLOC_CAP_SPIRAM);
+spi_device_transmit(spi, &trans);  // DMA writes to buf
+process(buf);  // CPU reads stale cached values, not what DMA wrote!
+```
+
+**GOOD** - Invalidate cache after DMA write:
+```c
+uint8_t *buf = heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
+spi_device_transmit(spi, &trans);
+esp_cache_msync(buf, size, ESP_CACHE_MSYNC_FLAG_DIR_M2C);  // Memory→Cache
+process(buf);  // Now reads DMA-written data
+```
+
+**Direction flags:**
+- `ESP_CACHE_MSYNC_FLAG_DIR_C2M` — Cache→Memory: flush CPU writes before DMA reads
+- `ESP_CACHE_MSYNC_FLAG_DIR_M2C` — Memory→Cache: invalidate cache after DMA writes
+
+### DMA Descriptors Must Not Be in PSRAM
+
+DMA linked-list descriptors (used by SPI, I2S, LCD) must reside in internal DRAM.
+
+**BAD:**
+```c
+dma_descriptor_t *desc = heap_caps_malloc(sizeof(*desc), MALLOC_CAP_SPIRAM);
+// Hardware DMA cannot address PSRAM for descriptors — crashes silently
+```
+
+**GOOD:**
+```c
+dma_descriptor_t *desc = heap_caps_malloc(sizeof(*desc),
+                              MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
 ```
 
 ### Critical Sections and ISRs
